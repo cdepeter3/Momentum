@@ -1,0 +1,396 @@
+---
+title: "Momentum Strategy - Connor DePeter"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include=FALSE}
+### Set Up Libraries ###
+library(data.table)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(lubridate)
+library(plotly)
+library(ggplot2)
+library(zoo)
+library(timeDate)
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+### Import Data ###
+
+crspOG <- fread(file = "C:/Users/conno/Desktop/GaTech/QCF/Fall 2019/Finance and Investments/Momentum/crsp_monthly.csv", drop = c("PERMCO", "SHROUT"))
+crsp = copy(crspOG)
+
+strTemp = c("SHRCD", "PRC", "RET", "DLRET")
+crsp[, (strTemp) := lapply(.SD, as.numeric), .SDcols = strTemp]
+
+crsp$PRC = abs(crsp$PRC)
+
+crsp <- crsp[(SHRCD == 10 | SHRCD == 11)]
+
+```
+
+```{r, include=FALSE, echo=FALSE}
+### Calculate Returns ###
+
+# Format date, drop nan's, initialize AnnualReturn column
+crsp$date = paste0(substr(crsp$date, 1, 4), "-", substr(crsp$date, 5, 6), "-", substr(crsp$date, 7, 8))
+crsp$date = format(as.Date(crsp$date, format = "%Y-%m-%d"),"%Y-%m-%d")
+crsp$date = as.Date(crsp$date, format = "%Y-%m-%d")
+
+crsp[!is.na(crsp$DLRET), RET := DLRET]
+
+crsp <- crsp[order(PERMNO, date)]
+
+crsp[, AnnualReturn := shift(RET, n=1), by=PERMNO]
+
+crsp$PRC[is.na(crsp$PRC)] = 0
+
+# calculate annual return via cumulative product
+for (i in c(1:11)){ 
+  crsp[, AnnualReturn := (1+shift(RET, n = i+1))*(1+AnnualReturn)-1, by=PERMNO]
+}
+
+# Find minimum price over look-back period (will exclude those under $5)
+crsp <- crsp %>% 
+  group_by(PERMNO) %>%
+  mutate(minPrice = rollapplyr(PRC, width=list(-12:-1), min, fill=NA)) %>%
+  ungroup()
+
+crsp <- as.data.table(crsp)
+
+crsp <- crsp[!is.na(crsp$AnnualReturn),] # Only keep rows where there is an Annual Return
+crsp = crsp[order(AnnualReturn)] # Sort by Annual Return
+
+# Get percentile rank for the stocks whose prices were not less than $5 for the previous year
+returnDec <- crsp[minPrice >= 5, .(perRank = percent_rank(AnnualReturn), PERMNO=PERMNO), by=date]
+getDec <- merge(crsp, returnDec, all = TRUE, by=c("PERMNO", "date"))
+
+```
+
+```{r, include=FALSE, echo=FALSE}
+### Calculate future returns ###
+
+# initialize columns for forward-looking returns in getDec (get deciles) 
+getDec = getDec[order(PERMNO, date)]
+getDec <- getDec[, .(date=date, PastYear = AnnualReturn, perRank = perRank, thisMonth = RET, Next_1=shift(RET, n=-1), 
+                     Next_3=shift(RET, n=-1), Next_6=shift(RET, n=-1), Next_12=shift(RET, n=-1), 
+                     Next_36=shift(RET, n=-1), Next_60=shift(RET, n=-1)), by=PERMNO]
+
+# For each month, calculate return over each holding period (3mo, 6mo, etc) using cumulative returns of those months
+
+# 3 Months
+for (i in c(2:3)){
+  getDec[, Next_3 := (1+shift(thisMonth, n = -i))*(1+Next_3)-1, by=PERMNO]
+}
+
+# 6 Months
+for (i in c(2:6)){
+  getDec[, Next_6 := (1+shift(thisMonth, n = -i))*(1+Next_6)-1, by=PERMNO]
+}
+
+# 12 Months
+for (i in c(2:12)){
+  getDec[, Next_12 := (1+shift(thisMonth, n = -i))*(1+Next_12)-1, by=PERMNO]
+}
+
+# 36 Months
+for (i in c(2:36)){
+  getDec[, Next_36 := (1+shift(thisMonth, n = -i))*(1+Next_36)-1, by=PERMNO]
+}
+
+# 60 Months
+for (i in c(2:60)){
+  getDec[, Next_60 := (1+shift(thisMonth, n = -i))*(1+Next_60)-1, by=PERMNO]
+}
+
+getDec[, ("perRank") := lapply(.SD, as.numeric), .SDcols = "perRank"]
+
+topAvg <- getDec[perRank > 0.9, ] # Top decile
+bttmAvg <- getDec[perRank < 0.1, ] # Bottom decile, set to have same number of rows as top decile
+# (perRank < 0.55) & (perRank > 0.45)
+
+# Get average return over each holding period of top/bottom decile (since portfolio is avg of underlying holdings)
+topAvg <- topAvg[, .(Top_1=mean(Next_1, na.rm = TRUE), Top_3=mean(Next_3, na.rm = TRUE), 
+                     Top_6=mean(Next_6, na.rm = TRUE), Top_12=mean(Next_12, na.rm = TRUE), 
+                     Top_36=mean(Next_36, na.rm = TRUE), Top_60=mean(Next_60, na.rm = TRUE)), by=date]
+
+bttmAvg <- bttmAvg[, .(Bottom_1=mean(Next_1, na.rm = TRUE), Bottom_3=mean(Next_3, na.rm = TRUE), 
+                       Bottom_6=mean(Next_6, na.rm = TRUE), Bottom_12=mean(Next_12, na.rm = TRUE), 
+                       Bottom_36=mean(Next_36, na.rm = TRUE), Bottom_60=mean(Next_60, na.rm = TRUE)), by=date]
+
+```
+
+```{r, include=FALSE, echo=FALSE}
+### Analyzing and backtesting ###
+
+# Join averages from above, find UMD
+Up_Down <- merge(topAvg, bttmAvg, all = TRUE, by = "date")
+
+NewColNames = c("UMD_1","UMD_3","UMD_6","UMD_12","UMD_36","UMD_60")
+topNames = c("Top_1","Top_3","Top_6","Top_12","Top_36","Top_60")
+btmNames = c("Bottom_1","Bottom_3","Bottom_6","Bottom_12","Bottom_36","Bottom_60")
+timeVec = c(1/12, 1/4, 1/2, 1, 3, 5)
+
+# calculate UMD (up minus down - long top decile and short bottom decile) for every holding period
+# finding both the return over each holding period (ie. 3mo, 6mo, etc) and the annualized return, to help compare
+for (j in c(1:6)){
+  var = NewColNames[j]
+  varAnn = paste0(var, "Ann")
+  
+  topVar = topNames[j]
+  topAnn = paste0(topVar, "Ann")
+  
+  btmVar = btmNames[j]
+  btmAnn = paste0(btmVar, "Ann")
+  
+  lenTime = timeVec[j]
+  up = j+1
+  down = j+7
+  
+  Up_Down[, var] = Up_Down[,..up] - Up_Down[,..down]
+  Up_Down[, varAnn] = (Up_Down[,..var] + 1)^(1/lenTime) - 1 # Annualized Return
+  
+  # Up_Down[, topAnn] = (Up_Down[,..topVar] + 1)^(1/lenTime) - 1 # Annualized Return
+  # Up_Down[, btmAnn] = (Up_Down[,..btmVar] + 1)^(1/lenTime) - 1 # Annualized Return
+}
+
+```
+
+
+```{r, echo=FALSE}
+### T-Test ### 
+
+# test for statistical significance of results 
+tTestTop <- t.test(Up_Down$Top_1, mu=0)
+tTestBottom <- t.test(Up_Down$Bottom_1, mu=0)
+tTestUMD <- t.test(Up_Down$UMD_1, mu=0)
+
+tTestResults <- setnames(data.table(matrix(ncol = 4, nrow = 3)), c("Measure", "Top Portfolio", "Bottom Portfolio", "UMD Portfolio"))
+tTestResults[, Measure := c("Statistic", "p.value", "Estimate")]
+tTestResults[, `Top Portfolio` := c(tTestTop$statistic, tTestTop$p.value, tTestTop$estimate)]
+tTestResults[, `Bottom Portfolio` := c(tTestBottom$statistic, tTestBottom$p.value, tTestBottom$estimate)]
+tTestResults[, `UMD Portfolio` := c(tTestUMD$statistic, tTestUMD$p.value, tTestUMD$estimate)]
+
+tTestResults %>%
+  kable(padding=2, caption = "Portfolio Return T-Test Results") %>%
+  kable_styling(bootstrap_options = c("hover", "striped", "condensed", full_width = FALSE))
+
+
+```
+
+The momentum strategy is based on the Up-Minus-Down (UMD) factor, which suggests that stocks that have performed well in the recent past will continue to rise and stocks that have fallen recently will continue to decline. This analysis tested the historical performance of the momentum strategy by sorting the past 12-month return of each stock whose share price remained above $5 for the full year into deciles, and making an 'Up' and 'Down' Portfolio from an equal weighting of the top and bottom deciles, respectively, and an UMD Portfolio by longing the Up Portfolio and shorting the Down Portfolio. The forward returns of these three portfolios, starting at each month, were then calculated for the next 1, 3, 6, 12, and 60 months. 
+
+The results show strong evidence of the momentum factors efficacy. A one-month holding period had an average return of 1.6% for the Up portfolio versus 0.5% for the Down portfolio. This outperformance persisted for every holding period from one month to three years; the Down portfolio outperformed on average for the five year holding period. Over the entire time period, 1927-2019, the Up portfolio outperformed over 70% of the time when held for a year or less. However, these portfolios demonstrated strong mean-reversion trends; as the holding period increased from one month to five years, the annualized holding period returns of the Up portfolio fell from 21% to 13%, while the annualized returns of the Down portfolio rose from 6% to 14%. This suggests that the momentum effect holds for the near-term after portfolio formation but that both the winners and losers experience similar returns over the long term. 
+
+```{r, echo=FALSE, warning=FALSE}
+## This portfolio held over time... ##
+# Find the percentage of time the up portfolio outperformed down, avg returns for each portfolio over each holder period, etc
+
+AllUMD = prod((Up_Down$UMD_1 + 1), na.rm = TRUE)
+AllTop = prod((Up_Down$Top_1 + 1), na.rm = TRUE)
+AllBottom = prod((Up_Down$Bottom_1 + 1), na.rm = TRUE)
+
+upVsDown <- setnames(data.table(matrix(nrow = 6, ncol = 8)), c("Holding_Period", "TopBeatBttm_Percent", "Mean_Top", "Mean_Bottom",
+                                                               "Mean_UMD", "Mean_TopAnn", "Mean_BottomAnn", "Mean_UMDAnn"))
+
+upVsDown[, Holding_Period := c("1 Month", "3 Months", "6 Months", "1 Year", "3 Year", "5 Years")]
+upVsDown[, TopBeatBttm_Percent := c(sum(Up_Down$Top_1>Up_Down$Bottom_1, na.rm = TRUE) / 
+                                      (length(Up_Down$Top_1>Up_Down$Bottom_1) - sum(is.na(Up_Down$UMD_1))),
+                                    sum(Up_Down$Top_3>Up_Down$Bottom_3, na.rm = TRUE) /
+                                      (length(Up_Down$Top_3>Up_Down$Bottom_3) - sum(is.na(Up_Down$UMD_3))),
+                                    sum(Up_Down$Top_6>Up_Down$Bottom_6, na.rm = TRUE) /
+                                      (length(Up_Down$Top_6>Up_Down$Bottom_6) - sum(is.na(Up_Down$UMD_6))),
+                                    sum(Up_Down$Top_12>Up_Down$Bottom_12, na.rm = TRUE) /
+                                      (length(Up_Down$Top_12>Up_Down$Bottom_12) - sum(is.na(Up_Down$UMD_12))),
+                                    sum(Up_Down$Top_36>Up_Down$Bottom_36, na.rm = TRUE) /
+                                      (length(Up_Down$Top_36>Up_Down$Bottom_36) - sum(is.na(Up_Down$UMD_36))),
+                                    sum(Up_Down$Top_60>Up_Down$Bottom_60, na.rm = TRUE) /
+                                      (length(Up_Down$Top_60>Up_Down$Bottom_60) - sum(is.na(Up_Down$UMD_60))))]
+
+# Avg returns
+upVsDown[, Mean_Top := c(mean(Up_Down$Top_1, na.rm = TRUE), 
+                         mean(Up_Down$Top_3, na.rm = TRUE),
+                         mean(Up_Down$Top_6, na.rm = TRUE),
+                         mean(Up_Down$Top_12, na.rm = TRUE),
+                         mean(Up_Down$Top_36, na.rm = TRUE),
+                         mean(Up_Down$Top_60, na.rm = TRUE))]
+
+upVsDown[, Mean_Bottom := c(mean(Up_Down$Bottom_1, na.rm = TRUE), 
+                            mean(Up_Down$Bottom_3, na.rm = TRUE),
+                            mean(Up_Down$Bottom_6, na.rm = TRUE),
+                            mean(Up_Down$Bottom_12, na.rm = TRUE),
+                            mean(Up_Down$Bottom_36, na.rm = TRUE),
+                            mean(Up_Down$Bottom_60, na.rm = TRUE))]
+
+upVsDown[, Mean_UMD := c(mean(Up_Down$UMD_1, na.rm = TRUE), 
+                         mean(Up_Down$UMD_3, na.rm = TRUE), 
+                         mean(Up_Down$UMD_6, na.rm = TRUE), 
+                         mean(Up_Down$UMD_12, na.rm = TRUE), 
+                         mean(Up_Down$UMD_36, na.rm = TRUE),
+                         mean(Up_Down$UMD_60, na.rm = TRUE))]
+
+# Avg Annualized returns
+upVsDown[, Mean_TopAnn := c((upVsDown$Mean_Top[1] + 1)^(12) - 1,
+                            (upVsDown$Mean_Top[2] + 1)^(4) - 1,
+                            (upVsDown$Mean_Top[3] + 1)^(2) - 1,
+                            (upVsDown$Mean_Top[4] + 1)^(1) - 1,
+                            (upVsDown$Mean_Top[5] + 1)^(1/3) - 1,
+                            (upVsDown$Mean_Top[6] + 1)^(1/5) - 1)]
+
+upVsDown[, Mean_BottomAnn := c((upVsDown$Mean_Bottom[1] + 1)^(12) - 1,
+                                (upVsDown$Mean_Bottom[2] + 1)^(4) - 1,
+                                (upVsDown$Mean_Bottom[3] + 1)^(2) - 1,
+                                (upVsDown$Mean_Bottom[4] + 1)^(1) - 1,
+                                (upVsDown$Mean_Bottom[5] + 1)^(1/3) - 1,
+                                (upVsDown$Mean_Bottom[6] + 1)^(1/5) - 1)]
+
+upVsDown[, Mean_UMDAnn := c((upVsDown$Mean_UMD[1] + 1)^(12) - 1,
+                            (upVsDown$Mean_UMD[2] + 1)^(4) - 1,
+                            (upVsDown$Mean_UMD[3] + 1)^(2) - 1,
+                            (upVsDown$Mean_UMD[4] + 1)^(1) - 1,
+                            (upVsDown$Mean_UMD[5] + 1)^(1/3) - 1,
+                            (upVsDown$Mean_UMD[6] + 1)^(1/5) - 1)]
+
+upVsDown[, TopBeatBttm_Percent := TopBeatBttm_Percent * 100]
+
+UvD_Table <- upVsDown[, .(`Holding Period` = Holding_Period, 
+                          `Up Portfolio` = Mean_Top*100, 
+                          `Down Portfolio` = Mean_Bottom*100, 
+                          `UMD Portfolio` = Mean_UMD*100)]
+
+UvD_Table %>%
+  kable(padding=2, caption = "Table 1. Average Percentage Return by Holding Period") %>%
+  kable_styling(bootstrap_options = c("hover", "striped", "condensed", full_width = FALSE))
+
+```
+
+```{r, echo=FALSE, warning=FALSE}
+## Plot cumulative returns over time ##
+My_Theme = theme( 
+  title = element_text(size = 18),
+  axis.title.x = element_text(size = 16),
+  axis.text.x = element_text(size = 8),
+  axis.title.y = element_blank(),
+  legend.title = element_blank())
+
+totalRet = setnames(data.table(matrix(ncol = 4, nrow = nrow((Up_Down)))), c("Date", "Top", "Bottom", "UMD"))
+
+totalRet[, Date := Up_Down$date]
+totalRet[, Top := cumprod(Up_Down$Top_1 + 1) - 1]
+totalRet[, Bottom := cumprod(Up_Down$Bottom_1 + 1) - 1]
+totalRet[, UMD := cumprod(Up_Down$UMD_1 + 1) - 1]
+
+ggplot() +
+  geom_line(totalRet, mapping=aes(x=Date,y=Top, color="Top")) +
+  geom_line(totalRet, mapping=aes(x=Date,y=Bottom, color="Bottom")) +
+  geom_line(totalRet, mapping=aes(x=Date,y=UMD, color="UMD")) +
+  scale_x_date(date_labels = "%Y") +
+  # ylim(-1, 1000) +
+  labs(x="Year", y="Cumulative Return") + 
+  ggtitle("Cumulative Return of Top, Bottom, and UMD Portfolios") +
+  My_Theme
+
+# Plots
+Up_Down$date = as.Date(Up_Down$date, format = "%Y-%m-%d")
+
+# ggplot() +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_1, color="UMD_1")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_3, color="UMD_3")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_6, color="UMD_6")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_12, color="UMD_12")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_60, color="UMD_60")) +
+#   scale_x_date(date_labels = "%Y") +
+#   # ylim(-1, 1) +
+#   labs(x="Year", y="UMD") + 
+#   ggtitle("Momentum Portfolio Forward-Looking Returns over Time") +
+#   My_Theme
+# 
+# ggplot() +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_1Ann, color="UMD_1")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_3Ann, color="UMD_3")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_6Ann, color="UMD_6")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_12Ann, color="UMD_12")) +
+#   geom_line(Up_Down, mapping=aes(x=date,y=UMD_60Ann, color="UMD_60")) +
+#   scale_x_date(date_labels = "%Y") +
+#   # ylim(-2, 10) +
+#   labs(x="Year", y="UMD") + 
+#   ggtitle("Momentum Portfolio Forward-Looking Returns over Time (Annualized)") +
+#   My_Theme
+
+```
+
+```{r, echo=FALSE, warning=FALSE}
+### Fama-French ###
+# Calculate FF 5 Factor alpha
+
+FFFF <- fread(file = "C:/Users/conno/Desktop/GaTech/QCF/Fall 2019/Finance and Investments/Momentum/F-F_Research_Data_5_Factors_2x3.csv")
+FFFF[, date := paste0(substr(V1, 1, 4), "-", substr(V1, 5, 6), "-01")]
+FFFF[, V1 := NULL]
+FFFF$date = format(as.Date(FFFF$date, format = "%Y-%m-%d"),"%Y-%m-%d")
+FFFF$date = as.Date(FFFF$date, format = "%Y-%m-%d")
+FFFF[, date := ceiling_date(date, "month") - days(1)]
+
+# Merge FF and UMD data
+UMD_FF <- copy(Up_Down)
+UMD_FF <- UMD_FF[, c("date", "Top_1", "Bottom_1", "UMD_1"), with=FALSE]
+UMD_FF[, date := ceiling_date(date, "month") - days(1)]
+
+UMD_FF <- merge(UMD_FF[, c("date", "Top_1", "Bottom_1", "UMD_1"), with=FALSE], FFFF, all = TRUE, by = "date")
+UMD_FF = na.omit(UMD_FF)
+setnames(UMD_FF, "Mkt-RF", "Mkt_RF")
+
+# Regress up, down, and UMD portfolios against all 5 FF factors
+TopReg <- lm(UMD_FF$Top_1 ~ UMD_FF$SMB + UMD_FF$Mkt_RF + UMD_FF$HML + UMD_FF$RMW + UMD_FF$CMA)
+BtmReg <- lm(UMD_FF$Bottom_1 ~ UMD_FF$SMB + UMD_FF$Mkt_RF + UMD_FF$HML + UMD_FF$RMW + UMD_FF$CMA)
+UMDReg <- lm(UMD_FF$UMD_1 ~ UMD_FF$SMB + UMD_FF$Mkt_RF + UMD_FF$HML + UMD_FF$RMW + UMD_FF$CMA)
+
+RegressionResults <- setnames(data.table(matrix(ncol = 4, nrow = 2)), c("Measure", "Top Portfolio", 
+                                                                        "Bottom Portfolio", "UMD Portfolio"))
+RegressionResults[, Measure := c("Intercept", "p-value")]
+RegressionResults[, `Top Portfolio` := c(as.character(signif(TopReg$coefficients[1],4)), as.character(signif(coef(summary(TopReg))[1,4],4)))]
+RegressionResults[, `Bottom Portfolio` := c(as.character(signif(BtmReg$coefficients[1],4)), as.character(signif(coef(summary(BtmReg))[1,4],4)))]
+RegressionResults[, `UMD Portfolio` := c(as.character(signif(UMDReg$coefficients[1],4)), as.character(signif(coef(summary(UMDReg))[1,4],4)))]
+
+RegressionResults %>%
+  kable(padding=2, caption = "Table 2. Fama-French Five Factor Regression Results") %>%
+  kable_styling(bootstrap_options = c("hover", "striped", "condensed", full_width = FALSE))
+
+```
+
+A regression analysis was performed on the momentum strategy (Table 2, above) and found that the results are statistically different from 0, indicating that the factor is a legitimate source of alpha and not merely noise in the data. The UMD portfolio had positive outperformance versus the market and the Fama-French Five Factor model, although the 'Minus-Down' aspect contributed little to the overall results. Both the Up and Down portfolios had positive returns, on average, over every holding period, so the difference between the two was less than the return of simply holding the Up portfolio; the short position in the Down portfolio was a net detractor from total returns, with all of the outperformance being contributed by the Up portfolio. However, the short position in the Down portfolio is what allowed this strategy to be self-funding. Despite lowering the total returns, shorting the Down portfolio enabled the UMD portfolio to achieve market-beating returns with minimal initial equity investment, so the return on capital of the momentum strategy would actually be much higher than indicated, assuming one can recieve reasonable terms and costs on the borrowed money. 
+
+```{r, echo=FALSE}
+### Annual Analysis ###
+# in which years did the UMD have the worst performance?
+
+Up_Down[, Year := year(date)]
+
+yearStats <- Up_Down[, .(cumTop = prod(Top_1 + 1) - 1, cumBot = prod(Bottom_1 + 1) - 1, cumUMD = prod(UMD_1 + 1) - 1), by=Year]
+
+losingYears <- setnames(data.table(matrix(ncol = 4, nrow = 5)), c("Year", "UMD_Portfolio", "Up_Portfolio", "Down_Portfolio"))
+losingYears[, Year := yearStats[order(cumUMD)]$Year[1:5]]
+losingYears[, UMD_Portfolio := yearStats[order(cumUMD)]$cumUMD[1:5]]
+losingYears[, Up_Portfolio := yearStats[order(cumUMD)]$cumTop[1:5]]
+losingYears[, Down_Portfolio := yearStats[order(cumUMD)]$cumBot[1:5]]
+
+losingYears %>%
+  kable(padding=2, caption = "Largest Annual Declines, UMD Portfolio") %>%
+  kable_styling(bootstrap_options = c("hover", "striped", "condensed", full_width = FALSE))
+
+# Three year rolling windows, percentage of periods with negative 3yr returns
+perNeg = sum(Up_Down$UMD_36<0, na.rm = TRUE) / (length(Up_Down$UMD_36<0) - sum(is.na(Up_Down$UMD_36)))
+
+```
+
+The five largest annual declines for the UMD Portfolio are shown in the table above. These years are primarily after, or during the later stages of, a crisis or recession. Both the Up and Down Portfolios performed well during these years, with the Down Portfolio significantly outperforming Up. This, combined with the timing, suggests that the stock market was experiencing a rapid recovery after falling drastically, with the stocks that performed worst over the past year having the strongest recovery. This information can be used to adjust the Momentum strategy; during a recession, the portfolio should tilt away from the top decile and towards the bottom decile in anticipation of a strong reversal when the recession ends. 
+
+Rolling forward 3-year returns were calculated for each month, and it was found that the UMD Portfolio experienced negative returns in 44% of the rolling 3-year windows. This is consistent with the earlier findings that the likelihood and magnitude of the top decile outperforming the bottom decreased consistently as the holding period lengthened. 
